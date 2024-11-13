@@ -1,0 +1,318 @@
+
+%This is the main module where everything in the code runs in parallel%
+module MAIN:
+
+%These are all the required inputs given to us%
+
+%Below are considered pure inputs since they are not declared by anything such as integer etc%
+input On, Off, Resume, Set, QuickDecel, QuickAccel;
+
+%Below are inputs declared as floats meaning we input a value into the input before ticking%
+input Accel : float, Brake : float, Speed : float;
+
+%Outputs
+output CruiseSpeed : float;
+output CruiseState : integer;
+output ThrottleCmd : float;
+
+
+%This is a signal that is used to emit the cruiseState at every tick. What 
+%it does is when running all 3 modules, the code will try to detect any 
+%conditions being violated in the FSM module to see if it should jump state immediately
+
+signal state : integer in
+
+    %We will always be looping here and continuously emitting the currentState value on every tick%
+	[ loop
+	    present state then
+			emit CruiseState(?state);
+			end present;
+			pause;
+	end loop ]
+	||
+    %The way the assigning works here is the left side would be the variables in 
+    %the main module and on the right side it will be the variables in the FSM module. By writing it such that On/On_FSM, we are basically
+    %Renaming On_FSM to be On and connecting the behavior of On_FSM to On, its sort of like VHDL and assigning signals to other signals
+    %Run is also a way of just running the submodule inside the main module, the || denotes that we will be running each submodule in parallel
+    %with eachother
+
+    run FSM [ signal On/On_FSM;
+            signal Off/Off_FSM;
+            signal Resume/Resume_FSM;
+            signal Accel/Accel_FSM;
+            signal Brake/Brake_FSM;
+            signal state/State_FSM;
+            signal Speed/Speed_FSM ]
+	||
+    run carDrivingControl [ signal Accel/Accel_drive;
+                            signal CruiseSpeed/CruiseSpeed_drive;
+                            signal state/State_drive;
+                            signal Speed/Speed_drive;
+                            signal ThrottleCmd/Throttle_drive ]
+
+    ||
+	run cruiseSpeedManage [ signal Set/Set_c;
+                            signal QuickAccel/QuickAccel_c;
+                            signal QuickDecel/QuickDecel_c;
+                            signal state/State_current;
+                            signal Speed/Speed_current;
+                            signal CruiseSpeed/currentSpeed ]
+end signal
+
+end module
+
+module FSM:
+
+    %These are constants declared in the header file but we still have to locally define it to be used, 
+    %esterel automatically maps them to the values
+    %set in the header file
+    constant PedalsMin : float;
+    constant SpeedMin : float;
+    constant SpeedMax : float;
+
+    %inputs
+    input On_FSM, Off_FSM, Resume_FSM;
+    input Accel_FSM: float, Brake_FSM: float, Speed_FSM : float;
+
+    %Outputs
+    output State_FSM : integer;
+
+    %OFF-1 ON-2 STDBY-3 DIS-4
+
+    %Initialising our initial state to be the off state
+    var state := 1 : integer in
+
+        %will be continuously looping here
+        loop
+            %on ever loop we will emit the current state of the system we are in
+            emit State_FSM(state);
+            %We pause for one instance or one tick here so that the code has time to load the state
+            pause;
+
+            %The contents of the code within the trap statement is immediately started when the trap statement starts. Its
+            %execution continues up to termination or trap exit, which is provoked by
+            %executing the “exit initial” statement, this is good for us as when a certain condition occurs, we want to
+            %assign the corresponding variable and immediately exit before changing it on accident somewhere else
+            trap initial in
+                    %if OFF
+                    if state = 1 then
+                        %The present statement is used as when we detect a change with the pure inputs from low to high within a tick and then we
+                        %go to the next tick then we will enter the statement, its sort of like an if statement but used for pure signals
+                        present On_FSM then
+                            %If we detect the On_FSM then we will transfer to the On state on the next tick
+                            state:=2;
+                            %we exit the trap here immediately so that we emit the newest value of our currentstate
+                            exit initial;
+                        end present;
+
+                    %if ON
+                    elsif state = 2 then
+                        %checks if off button is pressed then goes to the off state
+                        present Off_FSM then
+                            state:=1;
+                            exit initial;
+                        end present;
+
+                        %checks if any of the following conditions are violated and jumps to the disable state.
+                        if (?Accel_FSM>=PedalsMin) or (?Speed_FSM>SpeedMax) or (?Speed_FSM<SpeedMin) then
+                            state:= 4;
+                            exit initial;
+                        end if;
+
+                        %checks if brake violation has occurred to go to the standby state.
+                        if (?Brake_FSM>PedalsMin) then
+                            state:=3;
+                            exit initial;
+                        end if;
+
+                    %if STDBY
+                    elsif state = 3 then
+                        %If off button pressed return to off state
+                        present Off_FSM then
+                            state:=1;
+                            exit initial;
+                        end present;
+
+                        %if in the current tick, we detect the Resume input being high then we enter the following:
+                        present Resume_FSM then
+
+                            %Jump to On state if everything is within constraints
+                            if (?Accel_FSM<PedalsMin) and (?Speed_FSM<SpeedMax) and (?Speed_FSM>SpeedMin) then
+                                state:=2;
+                                exit initial;
+                            end if;
+
+                            %Jump to disable state if anything is outside constraints
+                            if(?Accel_FSM>PedalsMin) or (?Speed_FSM>SpeedMax) or (?Speed_FSM<SpeedMin) then
+                                state:=4;
+                                exit initial;
+                            end if;
+
+                        end present;
+
+                    %if DISABLE
+                    elsif state = 4 then
+                        %If off button pressed return to off state
+                        present Off_FSM then
+                            state:=1;
+                            exit initial;
+                        end present;
+
+                        %If within the limits and accel pedal not pressed we go to the on state
+                        if (?Accel_FSM<PedalsMin) and (?Speed_FSM<SpeedMax) and (?Speed_FSM>SpeedMin) then
+                            state:=2;
+                            exit initial;
+                        end if;
+                    else
+                        exit initial;
+                	end if;
+            end trap
+        end loop
+    end var
+end module
+
+%The following is a submodule to control the regulation of the cruisecontrol depending on what state we are in
+module carDrivingControl:
+    %Constants are taken care of in the cruiseregulation.c
+    
+    % Inputs %
+    input Accel_drive : float;
+    input CruiseSpeed_drive : float;
+    input State_drive : integer;
+    input Speed_drive : float;
+
+    % Outputs %
+    output Throttle_drive : float;
+
+    %Here we call a function from our c file that handles the cruiseregulation
+    function regulateThrottle(boolean, float, float): float;
+
+    var isGoingOn := false : boolean in
+    var throttleOut := 0.0f : float in
+
+    loop
+        %emitting the throttle signal on every loop
+		emit Throttle_drive(throttleOut);
+		pause;
+
+        trap initial in
+            %If we are in the off state then the car speed is driven by the accelerator pedal
+            if (?State_drive = 1) then
+                throttleOut:= ?Accel_drive;
+                exit initial;
+            %If we are in the on state then we have to do further checks before we can do anything
+            elsif(?State_drive = 2) then
+                %the use of pre here determines what the value of a signal was in the previous tick, so here if we are in the on state
+                %but we previously were in the off state then our isGoingOn variable should be set to high, the same thing should occur from 
+                %going from any of the other states to on
+                if(pre(?State_drive)=1) then
+                    isGoingOn:= true;
+                elsif(pre(?State_drive)=3) then
+                    isGoingOn:= true;
+                elsif(pre(?State_drive)=4) then
+                    isGoingOn:= true;
+                %If previous tick was in the on state then isGoingOn should be false as we are already on%
+                else
+                    isGoingOn:= false;
+                end if;
+                %After each if statement is checked, we will then use our regulateThrottle function which is returned and assigned to our variable
+                %that we emit and we exit the trap to update the Throttle_drive signal
+                throttleOut:= regulateThrottle(isGoingOn, ?CruiseSpeed_drive, ?Speed_drive);
+                exit initial;
+             else
+                %if we are in any state besides the On state then the cars speed should be driven by the accelerator
+             	throttleOut:= ?Accel_drive;
+                exit initial;
+            end if;
+        end trap
+    end loop
+    end var
+    end var
+end module
+
+%In this submodule we will be determining the speed value
+module cruiseSpeedManage:
+
+    % Constants %
+    constant SpeedMin : float;
+    constant SpeedMax : float;
+    constant SpeedInc : float;
+
+    % Inputs %
+    input Set_c, QuickAccel_c, QuickDecel_c;
+    input State_current : integer;
+    input Speed_current : float;
+
+    % Outputs %
+    output currentSpeed : float;
+
+    var newSpeed := 0.0f : float in
+    var speedLastSet := 0.0f : float in
+        loop
+            emit currentSpeed(newSpeed);
+            pause;
+            trap initial in
+                %if off
+                if ?State_current = 1 then
+                    newSpeed := 0.0f;
+                    exit initial;
+
+                %if the cruise control system is on, so can be in either STDY, DISABLE OR ON
+                else
+                
+                    %If it is currently on On state, we want to see where we previously were to either set the output speed to be the new speed or the old one%
+                    if(?State_current = 2) then
+
+                        %Checking if we click the set button to set the speed to the variables
+                        present Set_c then
+                            speedLastSet:=?Speed_current;
+                            newSpeed:= ?Speed_current;
+                            exit initial;
+                        end present;
+
+                        %Here we are checking if we were previously in the off state but now in the on state then we will set our speed to whatever
+                        %our current input speed is
+                        if(pre(?State_current)=1) then
+                            newSpeed:=?Speed_current;
+                            exit initial;
+
+                        %If our previous state was stdby or disable then we want to be assigning our speed to be our last set speed when the set button
+                        %was pressed
+                        elsif(pre(?State_current)=3) then
+                            newSpeed:= speedLastSet;
+                            exit initial;
+                        elsif(pre(?State_current)=4) then
+                            newSpeed:=speedLastSet;
+                            exit initial;
+                        end if;
+                    end if;
+
+                    %If quickaccel is clicked we check if the speed we have incremented is greater than the speed max then either setting it to speed max or incrementing it
+                    present QuickAccel_c then
+                        if(newSpeed>SpeedMax) then
+                            newSpeed:= SpeedMax;
+                            exit initial;
+                        else
+                            newSpeed:= newSpeed + SpeedInc;
+                            exit initial;
+                        end if;
+                    end present;
+
+                     %If quickdecel is clicked we check if the speed we have decremented is lesser than the speed min then either setting it to speed min or decrementing it
+                    present QuickDecel_c then
+                        if(newSpeed<SpeedMin) then
+                            newSpeed:=SpeedMin;
+                            exit initial;
+                        else
+                            newSpeed:= newSpeed-SpeedInc;
+                            exit initial;
+                        end if;
+                    end present;
+                    exit initial;
+                end if;
+              end trap
+              end loop
+    end var
+    end var
+
+end module
